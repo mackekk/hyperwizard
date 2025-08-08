@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { audio } from '../audio/AudioManager'
 
 type KeyboardInputs = {
   moveLeft: boolean
@@ -155,6 +156,10 @@ function rectVsTiles(
   return { collided, correctionX, correctionY }
 }
 
+// Declare refs used in non-component helpers (assigned inside component)
+let visualsRef: React.MutableRefObject<{ streakCount: number; orbShadowBlur: number; enemyShadowBlur: number }> | null = null
+let drawTimeAvgMsRef: React.MutableRefObject<number> | null = null
+
 function drawBackground(
   context: CanvasRenderingContext2D,
   width: number,
@@ -176,7 +181,8 @@ function drawBackground(
   context.save()
   context.translate(-cameraX * 0.3, 0)
   context.globalAlpha = 0.25
-  for (let i = 0; i < STREAK_COUNT; i += 1) {
+  const streakCount = visualsRef && visualsRef.current ? visualsRef.current.streakCount : STREAK_COUNT
+  for (let i = 0; i < streakCount; i += 1) {
     const sx = ((i * 200 + t * 500) % (worldWidth + 400)) - 200
     const sy = (Math.sin(i * 0.7 + t * 2) * 0.5 + 0.5) * height
     context.strokeStyle = hsl((h1 + i * 5) % 360, 100, 70)
@@ -246,13 +252,18 @@ function drawTilesAndObjects(
     }
   }
 
-  // Orbs
+  // Orbs (cull by viewport X)
+  const vxLeft = cameraX
+  const vxRight = cameraX + viewportWidth
+  const margin = 64
   for (let i = 0; i < orbs.length; i += 1) {
     const orb = orbs[i]
     if (orb.collected) continue
+    if (orb.x + orb.radius < vxLeft - margin || orb.x - orb.radius > vxRight + margin) continue
     context.save()
+    const orbBlur = visualsRef && visualsRef.current ? visualsRef.current.orbShadowBlur : 15
     context.shadowColor = hsl((timeSeconds * 200 + orb.x) * 0.1, 100, 60)
-    context.shadowBlur = 15
+    context.shadowBlur = orbBlur
     context.fillStyle = hsl((timeSeconds * 200 + orb.x) * 0.1, 100, 70)
     context.beginPath()
     context.arc(orb.x, orb.y, orb.radius, 0, Math.PI * 2)
@@ -260,15 +271,17 @@ function drawTilesAndObjects(
     context.restore()
   }
 
-  // Enemies
+  // Enemies (cull by viewport X)
   for (let i = 0; i < enemies.length; i += 1) {
     const e = enemies[i]
     if (!e.alive) continue
+    if (e.x + e.width < vxLeft - margin || e.x > vxRight + margin) continue
     context.save()
     context.translate(e.x, e.y)
     const hue = (timeSeconds * 120 + e.x * 0.2 + e.y * 0.1) % 360
     context.shadowColor = hsl(hue, 100, 60)
-    context.shadowBlur = 20
+    const eBlur = visualsRef && visualsRef.current ? visualsRef.current.enemyShadowBlur : 20
+    context.shadowBlur = eBlur
     if (e.type === 'TRICK') {
       // Trickster: rotating diamond
       context.rotate(Math.sin(e.phase) * 0.6)
@@ -365,12 +378,14 @@ function drawHUD(
   context.save()
   context.fillStyle = '#0b0b0b'
   context.globalAlpha = 0.8
-  context.fillRect(8, 8, 460, 56)
+  context.fillRect(8, 8, 600, 70)
   context.globalAlpha = 1
   context.fillStyle = '#eaffff'
   context.font = '16px system-ui, -apple-system, Segoe UI, Roboto'
   context.fillText(`Orbs: ${orbsCollected}`, 16, 30)
   context.fillText('Move: ← →  | Jump: SPACE  | Run: SHIFT/X  | Restart: R', 16, 52)
+  const drawAvg = drawTimeAvgMsRef && drawTimeAvgMsRef.current ? drawTimeAvgMsRef.current : 0
+  context.fillText(`Draw: ${drawAvg.toFixed(1)} ms (avg)`, 16, 68)
 
   if (dead || won) {
     context.fillStyle = 'rgba(0,0,0,0.55)'
@@ -417,6 +432,18 @@ export default function HyperWizard() {
   const trailRef = useRef<{ x: number; y: number }[]>([])
   const deadRef = useRef<boolean>(false)
   const wonRef = useRef<boolean>(false)
+  const footstepTimerRef = useRef<number>(0)
+  // Visual tuning (adaptive quality)
+  const visualsLocalRef = useRef({
+    streakCount: STREAK_COUNT,
+    orbShadowBlur: 15,
+    enemyShadowBlur: 20,
+  })
+  const drawTimeAvgLocalRef = useRef<number>(0)
+
+  // Expose to helper functions
+  visualsRef = visualsLocalRef as any
+  drawTimeAvgMsRef = drawTimeAvgLocalRef as any
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -494,6 +521,9 @@ export default function HyperWizard() {
     canvas.focus()
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Initialize shared audio and start subtle music on first interaction
+      audio.init()
+      audio.startMusic('pad1')
       const code = event.code
       if (
         code === 'ArrowLeft' ||
@@ -513,6 +543,7 @@ export default function HyperWizard() {
         event.preventDefault()
       }
       if (code === 'Space' || code === 'KeyW' || code === 'ArrowUp') inputsRef.current.jump = true
+      if (code === 'KeyM') audio.toggleMute()
     }
 
     const handleKeyUp = (event: KeyboardEvent) => {
@@ -594,13 +625,17 @@ export default function HyperWizard() {
       const baseSpeed = physicsConstants.baseMoveSpeed * (running ? physicsConstants.runMultiplier : 1)
       const targetVX = (inputs.moveLeft ? -baseSpeed : 0) + (inputs.moveRight ? baseSpeed : 0)
       const accel = player.isOnGround ? physicsConstants.groundAcceleration : physicsConstants.airAcceleration
-      const dv = clamp(targetVX - player.velocityX, -accel * fixedDeltaSeconds, accel * fixedDeltaSeconds)
+      // Add small braking boost when changing direction to reduce sticky feel
+      const changingDir = Math.sign(targetVX) !== Math.sign(player.velocityX) && Math.abs(targetVX) > 0 && Math.abs(player.velocityX) > 0
+      const accelFactor = changingDir ? 1.35 : 1
+      const dv = clamp(targetVX - player.velocityX, -accel * accelFactor * fixedDeltaSeconds, accel * accelFactor * fixedDeltaSeconds)
       player.velocityX += dv
 
       // Jump
       if (inputs.jump && player.isOnGround) {
         player.velocityY = physicsConstants.jumpBase + (running ? physicsConstants.jumpRunBoost : 0)
         player.isOnGround = false
+        audio.playSfx('jump')
       }
 
       // Gravity
@@ -635,7 +670,10 @@ export default function HyperWizard() {
       // World bounds death
       const worldHeight = level.tiles.length * level.tileSize
       if (player.positionY > worldHeight + 200) {
-        deadRef.current = true
+        if (!deadRef.current) {
+          deadRef.current = true
+          audio.playSfx('death')
+        }
       }
 
       // Spike check near feet
@@ -644,7 +682,12 @@ export default function HyperWizard() {
       if (feetRow >= 0 && feetRow < level.tiles.length && midCol >= 0 && midCol < level.tiles[0].length) {
         let spikeHere = level.tiles[feetRow][midCol] === T_SPIKE
         if (!spikeHere && feetRow - 1 >= 0) spikeHere = level.tiles[feetRow - 1][midCol] === T_SPIKE
-        if (spikeHere) deadRef.current = true
+        if (spikeHere) {
+          if (!deadRef.current) {
+            deadRef.current = true
+            audio.playSfx('death')
+          }
+        }
       }
 
       // Orbs collection
@@ -656,14 +699,23 @@ export default function HyperWizard() {
         const dy = player.positionY + player.height / 2 - c.y
         if (dx * dx + dy * dy < (c.radius + 12) * (c.radius + 12)) {
           c.collected = true
+          audio.playSfx('collect')
         }
       }
 
-      // Enemies update and collisions
+      // Enemies update and collisions (simulate only near viewport)
       const enemies = enemiesRef.current
       for (let i = 0; i < enemies.length; i += 1) {
         const e = enemies[i]
         if (!e.alive) continue
+        const canvasEl = ctxRef.current ? (ctxRef.current.canvas as HTMLCanvasElement) : null
+        const viewportWidth = canvasEl ? canvasEl.clientWidth : 0
+        const vxLeft = cameraRef.current.x
+        const vxRight = cameraRef.current.x + viewportWidth
+        if (e.x + e.width < vxLeft - 128 || e.x > vxRight + 128) {
+          // Skip offscreen enemies to avoid unnecessary work far away
+          continue
+        }
         e.phase += fixedDeltaSeconds * 2
         e.velocityY = clamp(e.velocityY + physicsConstants.gravity * fixedDeltaSeconds, -9999, physicsConstants.maxFallSpeed)
         // Move X with collisions
@@ -703,8 +755,10 @@ export default function HyperWizard() {
             // Stomp
             e.alive = false
             player.velocityY = physicsConstants.jumpBase * 0.55
+            audio.playSfx('stomp')
           } else {
             deadRef.current = true
+            audio.playSfx('death')
           }
         }
       }
@@ -718,20 +772,39 @@ export default function HyperWizard() {
         level.tiles[playerTileR][playerTileC] === T_FLAG
       ) {
         wonRef.current = true
+        audio.playSfx('win')
       }
 
-      // Camera follows player with slight lead horizontally
+      // Camera follows player with smoothed velocity-based lead (avoid sign flip jitter)
       const canvasEl = ctxRef.current ? (ctxRef.current.canvas as HTMLCanvasElement) : null
       const viewportWidth = canvasEl ? canvasEl.clientWidth : 0
       const viewportHeight = canvasEl ? canvasEl.clientHeight : 0
-      const lead = 80
-      cameraRef.current.x = clamp(player.positionX - viewportWidth / 2 + lead * Math.sign(player.velocityX), 0, Infinity)
-      cameraRef.current.y = clamp(player.positionY - viewportHeight / 2, 0, Infinity)
+      const maxLead = 120
+      const topSpeed = physicsConstants.baseMoveSpeed * physicsConstants.runMultiplier
+      const speedRatioRaw = topSpeed > 0 ? player.velocityX / topSpeed : 0
+      const speedRatio = Math.abs(player.velocityX) < 20 ? 0 : clamp(speedRatioRaw, -1, 1)
+      const desiredCamX = player.positionX - viewportWidth / 2 + maxLead * speedRatio
+      const smooth = 0.15
+      const smoothedX = cameraRef.current.x + (desiredCamX - cameraRef.current.x) * smooth
+      cameraRef.current.x = Math.max(0, Math.floor(smoothedX))
+      cameraRef.current.y = Math.max(0, Math.floor(player.positionY - viewportHeight / 2))
 
       // Trail
       const trail = trailRef.current
       trail.push({ x: player.positionX, y: player.positionY })
       if (trail.length > TRAIL_MAX) trail.shift()
+
+      // Footstep SFX when running on ground
+      if (player.isOnGround && Math.abs(player.velocityX) > 40) {
+        footstepTimerRef.current += fixedDeltaSeconds
+        const stepInterval = inputs.run ? 0.18 : 0.24
+        if (footstepTimerRef.current >= stepInterval) {
+          footstepTimerRef.current = 0
+          audio.playSfx('runStep')
+        }
+      } else {
+        footstepTimerRef.current = 0
+      }
     }
 
     function renderFrame(nowMs: number): void {
@@ -746,6 +819,9 @@ export default function HyperWizard() {
 
       const worldWidth = level.tiles[0].length * level.tileSize
       const timeSeconds = nowMs / 1000
+      // Clear frame explicitly (prevent residual artifacts when camera jumps)
+      const t0 = performance.now()
+      ctx.clearRect(0, 0, width, height)
       drawBackground(ctx, width, height, nowMs, cameraRef.current.x, worldWidth)
       drawTilesAndObjects(
         ctx,
@@ -761,6 +837,27 @@ export default function HyperWizard() {
       const trail = trailRef.current
       drawPlayer(ctx, player, cameraRef.current.x, cameraRef.current.y, timeSeconds, trail)
       const collected = orbsRef.current.reduce((acc, o) => acc + (o.collected ? 1 : 0), 0)
+      const t1 = performance.now()
+      // Exponential moving average of draw time
+      const prev = (drawTimeAvgMsRef && drawTimeAvgMsRef.current) ? drawTimeAvgMsRef.current : 0
+      const curr = t1 - t0
+      if (drawTimeAvgMsRef) {
+        drawTimeAvgMsRef.current = prev === 0 ? curr : prev * 0.9 + curr * 0.1
+      }
+      // Adaptive quality: if draw time spikes, reduce effects; if low, restore
+      if (visualsRef && drawTimeAvgMsRef && typeof drawTimeAvgMsRef.current === 'number') {
+        const v = visualsRef.current
+        const avg = drawTimeAvgMsRef.current
+        if (avg > 10) {
+          v.streakCount = Math.max(10, Math.floor(v.streakCount * 0.95))
+          v.orbShadowBlur = Math.max(6, Math.floor(v.orbShadowBlur * 0.95))
+          v.enemyShadowBlur = Math.max(8, Math.floor(v.enemyShadowBlur * 0.95))
+        } else if (avg < 6) {
+          v.streakCount = Math.min(STREAK_COUNT, Math.ceil(v.streakCount * 1.03))
+          v.orbShadowBlur = Math.min(15, Math.ceil(v.orbShadowBlur * 1.03))
+          v.enemyShadowBlur = Math.min(20, Math.ceil(v.enemyShadowBlur * 1.03))
+        }
+      }
       drawHUD(ctx, width, height, collected, deadRef.current, wonRef.current, timeSeconds)
     }
 
