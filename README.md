@@ -1,6 +1,6 @@
 # HyperWizard –  Canvas Platformer
 
-A neon, psychedelic platformer where a wizard sprints through hyperspace. Built for speed, clarity, and minimal config.
+A neon platformer where a wizard sprints through hyperspace. Built for speed, clarity, and minimal config.
 
 ## Project Goal
 - Ship a smooth, arcade-style platformer with tight feel (run + higher/longer jump).
