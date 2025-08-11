@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import DevOverlay from './DevOverlay'
 import { audio } from '../audio/AudioManager'
 
 type KeyboardInputs = {
@@ -18,6 +19,7 @@ type PlayerState = {
   width: number
   height: number
   isOnGround: boolean
+  canFly: boolean
 }
 
 type Level = {
@@ -373,7 +375,10 @@ function drawHUD(
   orbsCollected: number,
   dead: boolean,
   won: boolean,
-  timeSeconds: number
+  timeSeconds: number,
+  canFly: boolean,
+  flightMsgTime: number,
+  showMenuHintOnWin: boolean
 ) {
   context.save()
   context.fillStyle = '#0b0b0b'
@@ -383,7 +388,23 @@ function drawHUD(
   context.fillStyle = '#eaffff'
   context.font = '16px system-ui, -apple-system, Segoe UI, Roboto'
   context.fillText(`Orbs: ${orbsCollected}`, 16, 30)
-  context.fillText('Move: ← →  | Jump: SPACE  | Run: SHIFT/X  | Restart: R', 16, 52)
+  const ctrl = canFly
+    ? 'Move: ← →  | Jump/Fly: SPACE (hold to fly)  | Run: SHIFT/X  | Restart: R'
+    : 'Move: ← →  | Jump: SPACE  | Run: SHIFT/X  | Restart: R'
+  context.fillText(ctrl, 16, 52)
+
+  // Ephemeral flight unlock message
+  if (flightMsgTime > 0) {
+    const alpha = 0.6 + Math.sin(timeSeconds * 10) * 0.4
+    context.save()
+    context.globalAlpha = Math.max(0, Math.min(1, alpha))
+    context.fillStyle = '#fff'
+    context.font = '24px system-ui, -apple-system, Segoe UI, Roboto'
+    const msg = 'New power unlocked: Flight'
+    const tw = context.measureText(msg).width
+    context.fillText(msg, canvasWidth / 2 - tw / 2, 100)
+    context.restore()
+  }
   const drawAvg = drawTimeAvgMsRef && drawTimeAvgMsRef.current ? drawTimeAvgMsRef.current : 0
   context.fillText(`Draw: ${drawAvg.toFixed(1)} ms (avg)`, 16, 68)
 
@@ -395,6 +416,9 @@ function drawHUD(
     context.fillText(won ? 'You transcended!' : 'Lost in hyperspace!', canvasWidth / 2 - 150, canvasHeight / 2 - 10)
     context.font = '18px system-ui, -apple-system, Segoe UI, Roboto'
     context.fillText('Press R to play again', canvasWidth / 2 - 110, canvasHeight / 2 + 20)
+    if (won && showMenuHintOnWin) {
+      context.fillText('Press ENTER to return to Menu', canvasWidth / 2 - 145, canvasHeight / 2 + 46)
+    }
   }
 
   // Tiny draw time indicator shimmer
@@ -409,7 +433,7 @@ function clamp(value: number, min: number, max: number): number {
   return value
 }
 
-export default function HyperWizard() {
+export default function HyperWizard({ onExitToMenu }: { onExitToMenu?: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null)
   const inputsRef = useRef<KeyboardInputs>({
@@ -433,6 +457,7 @@ export default function HyperWizard() {
   const deadRef = useRef<boolean>(false)
   const wonRef = useRef<boolean>(false)
   const footstepTimerRef = useRef<number>(0)
+  const flightMsgTimerRef = useRef<number>(0)
   // Visual tuning (adaptive quality)
   const visualsLocalRef = useRef({
     streakCount: STREAK_COUNT,
@@ -462,6 +487,7 @@ export default function HyperWizard() {
       width: 20,
       height: 28,
       isOnGround: false,
+      canFly: false,
     }
 
     // Initialize orbs
@@ -469,6 +495,7 @@ export default function HyperWizard() {
     function addOrb(px: number, py: number) {
       orbsRef.current.push({ x: px, y: py, radius: 10, collected: false })
     }
+    // Place orbs (rough positions)
     for (let x = 24; x <= 26; x += 1) addOrb(x * 32 + 16, 9 * 32 + 12)
     for (let x = 46; x <= 58; x += 2) addOrb(x * 32 + 16, 10 * 32 - 16)
     for (let x = 66; x <= 70; x += 1) addOrb(x * 32 + 16, 8 * 32 - 8)
@@ -477,6 +504,38 @@ export default function HyperWizard() {
     for (let x = 140; x <= 155; x += 3) addOrb(x * 32 + 16, 10 * 32 - 20)
     for (let x = 168; x <= 174; x += 1) addOrb(x * 32 + 16, 7 * 32 - 16)
     for (let x = 185; x <= 200; x += 2) addOrb(x * 32 + 16, 12 * 32 - 20)
+
+    // After placing, snap each orb vertically so it sits within the player's height
+    // above the nearest walkable surface directly beneath it. This guarantees coins
+    // are always collectible while walking underneath them.
+    const level = levelRef.current
+    const player = playerRef.current
+    if (level && player) {
+      const tileSize = level.tileSize
+      const rows = level.tiles.length
+      const cols = level.tiles[0].length
+      for (let i = 0; i < orbsRef.current.length; i += 1) {
+        const orb = orbsRef.current[i]
+        const col = Math.max(0, Math.min(cols - 1, Math.floor(orb.x / tileSize)))
+        // Start searching from the orb's row downward for the first solid tile
+        let startRow = Math.floor(orb.y / tileSize)
+        if (startRow < 0) startRow = 0
+        if (startRow >= rows) startRow = rows - 1
+        let surfaceTopY: number | null = null
+        for (let r = startRow; r < rows; r += 1) {
+          const isSolid = isSolidTile(level.tiles[r][col])
+          const aboveIsEmpty = r === 0 ? true : !isSolidTile(level.tiles[r - 1][col])
+          if (isSolid && aboveIsEmpty) {
+            surfaceTopY = r * tileSize
+            break
+          }
+        }
+        if (surfaceTopY !== null) {
+          // Position the orb at the player's center height relative to the surface
+          orb.y = surfaceTopY - player.height / 2
+        }
+      }
+    }
 
     // Initialize enemies
     enemiesRef.current = []
@@ -501,7 +560,8 @@ export default function HyperWizard() {
     spawnEnemy(88, rows - 2, 'HYPER')
     spawnEnemy(107, 12, 'TRICK')
     spawnEnemy(147, 10, 'HYPER')
-    spawnEnemy(172, 8, 'TRICK')
+    // Move this foe from a high platform to the ground to ensure it is reachable
+    spawnEnemy(172, rows - 2, 'TRICK')
     spawnEnemy(196, 12, 'HYPER')
 
     // Resize canvas to fit window
@@ -544,6 +604,9 @@ export default function HyperWizard() {
       }
       if (code === 'Space' || code === 'KeyW' || code === 'ArrowUp') inputsRef.current.jump = true
       if (code === 'KeyM') audio.toggleMute()
+      if ((code === 'Enter' || code === 'Space') && wonRef.current && onExitToMenu) {
+        onExitToMenu()
+      }
     }
 
     const handleKeyUp = (event: KeyboardEvent) => {
@@ -631,15 +694,31 @@ export default function HyperWizard() {
       const dv = clamp(targetVX - player.velocityX, -accel * accelFactor * fixedDeltaSeconds, accel * accelFactor * fixedDeltaSeconds)
       player.velocityX += dv
 
-      // Jump
-      if (inputs.jump && player.isOnGround) {
-        player.velocityY = physicsConstants.jumpBase + (running ? physicsConstants.jumpRunBoost : 0)
-        player.isOnGround = false
-        audio.playSfx('jump')
+      // Jump / Flight
+      // Compute gravity after potential flight adjustment
+      let effectiveGravity = physicsConstants.gravity
+      if (inputs.jump) {
+        if (player.canFly) {
+          // Hold to fly: apply continuous upward thrust and reduce gravity while held
+          const flightThrust = -1650 // upward acceleration (reduced by 25%)
+          const gravityScaleWhileFlying = 0.25
+          if (player.isOnGround) {
+            // Give a quick lift-off impulse when starting from ground
+            player.velocityY = Math.min(player.velocityY, -420)
+            player.isOnGround = false
+            audio.playSfx('jump')
+          }
+          player.velocityY += flightThrust * fixedDeltaSeconds
+          effectiveGravity *= gravityScaleWhileFlying
+        } else if (player.isOnGround) {
+          player.velocityY = physicsConstants.jumpBase + (running ? physicsConstants.jumpRunBoost : 0)
+          player.isOnGround = false
+          audio.playSfx('jump')
+        }
       }
 
-      // Gravity
-      player.velocityY += physicsConstants.gravity * fixedDeltaSeconds
+      // Gravity (adjusted by flight)
+      player.velocityY += effectiveGravity * fixedDeltaSeconds
       player.velocityY = clamp(player.velocityY, -Infinity, physicsConstants.maxFallSpeed)
 
       // Integrate and collide X axis
@@ -664,6 +743,7 @@ export default function HyperWizard() {
         player.velocityY = 0
       } else {
         player.positionY = nextY
+        // While flying, don't glue to ground just because Space is held; keep in air until actual collision
         player.isOnGround = false
       }
 
@@ -674,6 +754,21 @@ export default function HyperWizard() {
           deadRef.current = true
           audio.playSfx('death')
         }
+      }
+
+      // Invisible world boundaries (keep player in-bounds left/right/top)
+      const worldWidth = level.tiles[0].length * level.tileSize
+      if (player.positionX < 0) {
+        player.positionX = 0
+        player.velocityX = 0
+      }
+      if (player.positionX > worldWidth - player.width) {
+        player.positionX = worldWidth - player.width
+        player.velocityX = 0
+      }
+      if (player.positionY < 0) {
+        player.positionY = 0
+        player.velocityY = 0
       }
 
       // Spike check near feet
@@ -761,6 +856,21 @@ export default function HyperWizard() {
             audio.playSfx('death')
           }
         }
+      }
+
+      // Flight unlock: when all enemies are defeated
+      if (!player.canFly) {
+        const anyAlive = enemiesRef.current.some((e) => e.alive)
+        if (!anyAlive) {
+          player.canFly = true
+          audio.playSfx('flight')
+          flightMsgTimerRef.current = 2
+        }
+      }
+
+      // Tick flight message timer
+      if (flightMsgTimerRef.current > 0) {
+        flightMsgTimerRef.current = Math.max(0, flightMsgTimerRef.current - fixedDeltaSeconds)
       }
 
       // Win detection by touching flag
@@ -858,7 +968,19 @@ export default function HyperWizard() {
           v.enemyShadowBlur = Math.min(20, Math.ceil(v.enemyShadowBlur * 1.03))
         }
       }
-      drawHUD(ctx, width, height, collected, deadRef.current, wonRef.current, timeSeconds)
+      const p = playerRef.current
+      drawHUD(
+        ctx,
+        width,
+        height,
+        collected,
+        deadRef.current,
+        wonRef.current,
+        timeSeconds,
+        p ? p.canFly : false,
+        flightMsgTimerRef.current,
+        !!onExitToMenu
+      )
     }
 
     let isRunning = true
@@ -892,17 +1014,58 @@ export default function HyperWizard() {
   }, [])
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        width: '100vw',
-        height: '100vh',
-        display: 'block',
-        background: '#0b1020',
-        outline: 'none',
-      }}
-      tabIndex={0}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        style={{
+          width: '100vw',
+          height: '100vh',
+          display: 'block',
+          background: '#0b1020',
+          outline: 'none',
+        }}
+        tabIndex={0}
+      />
+      <DevOverlay
+        getInfo={() => {
+          const player = playerRef.current
+          const enemies = enemiesRef.current
+          const orbs = orbsRef.current
+          const orbsCollected = orbs.reduce((a, o) => a + (o.collected ? 1 : 0), 0)
+          return {
+            canFly: !!(player && player.canFly),
+            enemiesAlive: enemies.filter((e) => e.alive).length,
+            orbsCollected,
+            totalOrbs: orbs.length,
+          }
+        }}
+        actions={{
+          toggleFlight: () => {
+            const p = playerRef.current
+            if (p) p.canFly = !p.canFly
+          },
+          grantFlight: () => {
+            const p = playerRef.current
+            if (p) p.canFly = true
+          },
+          revokeFlight: () => {
+            const p = playerRef.current
+            if (p) p.canFly = false
+          },
+          killAllEnemies: () => {
+            const list = enemiesRef.current
+            for (let i = 0; i < list.length; i += 1) list[i].alive = false
+          },
+          collectAllOrbs: () => {
+            const list = orbsRef.current
+            for (let i = 0; i < list.length; i += 1) list[i].collected = true
+          },
+          restart: () => {
+            inputsRef.current.restart = true
+          },
+        }}
+      />
+    </>
   )
 }
 

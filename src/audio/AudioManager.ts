@@ -12,7 +12,7 @@
 //   - envelope times (attack/hold/release) for pad notes
 // - Progression (mood): edit the 'progression' array in startMusic()
 
-export type SfxKind = 'jump' | 'runStep' | 'collect' | 'stomp' | 'death' | 'win'
+export type SfxKind = 'jump' | 'runStep' | 'collect' | 'stomp' | 'death' | 'win' | 'flight'
 
 type AudioNodes = {
   ctx: AudioContext
@@ -116,7 +116,7 @@ export class AudioManager {
     this.musicStarted = true
 
     const { ctx, busMusic } = this.nodes
-    const a3 = 220 // A3 in Hz
+    const a3 = 320 // A3 in Hz
 
     const hz = (semitonesFromA3: number) => a3 * Math.pow(2, semitonesFromA3 / 12)
     const triad = (root: number, type: 'minor' | 'major') => {
@@ -125,13 +125,15 @@ export class AudioManager {
     }
     // Am, F, C, G progression relative to A3
     const progression: Array<{ root: number; type: 'minor' | 'major' }> = [
-      { root: 0, type: 'minor' },   // A minor
-      { root: -4, type: 'major' },  // F major
-      { root: 3, type: 'major' },   // C major
-      { root: -2, type: 'major' },  // G major
-      { root: -4, type: 'major' },  // F major
-
-    ]
+      { root: 0,  type: 'major' }, // A
+      { root: -2, type: 'major' }, // G
+      { root: 5,  type: 'major' }, // D
+      { root: 7,  type: 'major' }, // E
+      { root: 0,  type: 'major' }, // A
+      { root: -2, type: 'major' }, // G
+      { root: 5,  type: 'major' }, // D
+      { root: 7,  type: 'major' }, // E
+    ];
 
     // Global slow vibrato that modulates oscillator detune (spacey motion)
     if (!this.musicVibrLfo || !this.musicVibrGain) {
@@ -258,6 +260,9 @@ export class AudioManager {
       case 'win':
         this.arpeggio([440, 440 * 1.25, 440 * 1.5, 440 * 2], 90, 0.35)
         break
+      case 'flight':
+        this.upSweep(160, 520, 280)
+        break
       default:
         break
     }
@@ -312,6 +317,22 @@ export class AudioManager {
     osc.frequency.setValueAtTime(fromHz, ctx.currentTime)
     osc.frequency.exponentialRampToValueAtTime(toHz, ctx.currentTime + durationMs / 1000)
     g.gain.value = 0.6
+    osc.connect(g)
+    g.connect(busSfx)
+    osc.start()
+    g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + durationMs / 1000)
+    osc.stop(ctx.currentTime + durationMs / 1000 + 0.02)
+  }
+
+  private upSweep(fromHz: number, toHz: number, durationMs: number): void {
+    if (!this.nodes) return
+    const { ctx, busSfx } = this.nodes
+    const osc = ctx.createOscillator()
+    const g = ctx.createGain()
+    osc.type = 'triangle'
+    osc.frequency.setValueAtTime(fromHz, ctx.currentTime)
+    osc.frequency.exponentialRampToValueAtTime(toHz, ctx.currentTime + durationMs / 1000)
+    g.gain.value = 0.55
     osc.connect(g)
     g.connect(busSfx)
     osc.start()
